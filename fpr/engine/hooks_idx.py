@@ -1,0 +1,1369 @@
+"""Engine hook: indexer + compressor of kernels/indexer2f on the engine's pools and StepBatch tables. Decode rows
+(next_n = 4 per sequence, sequence-contiguous) in run(); mixed steps in _run_general.
+
+Per index layer L, between the attention half's q / kv norms and FlashMLA (engine.p_attn -> Hooks.indexer_run):
+  kv sources (2 / 8 / 14 / 20), compressor (stock ops, owned rows):
+      ks = x @ comp_w^T (fp32) -> fused_save_compress_norm (ring = the rank's state pool, layer view [slots, 8, 1024],
+      ring slot = state_slot * 8 + p % 8; ratio 1: no ring) -> latent -> rope_quant_insert into the paged pool's comp{L}
+      records (slot = page * (64 // ratio) + (p % 64) // ratio from StepBatch.paged_slot; -1 = no write: padded and
+      prefix-cached rows) -> wk(latent) -> indexer_k_norm_rope_store into the paged pool's idx{L} entries (same slots)
+  every index layer, q path (default: exactly dequantized bf16 weights, the stock quant op):
+      w = x @ idx_wp^T, q = qr @ idx_wq_b^T, (q8, wo) = fused_indexer_q_rope_quant(pos, q, cos_sin, w, 128^-.5, 32^-.5)
+  scoring + selection: idx2f.OwnedIndexer(ks = this rank's idx pages of the 4 sources, block tables [B, 10240]).layer
+      -> request-local top-512 -> compute_global_topk_indices_and_lens (stock op) -> the bucket's ti[L] / tl[L], which
+      the FlashMLA calls of layers L .. next index layer read.
+
+CUDA graphs: OwnedIndexer.plan() is host-side; for a graph it is replaced by fixed bounds (widths and max lengths of the
+largest row the engine admits, MAX_CTX) and the DeepGEMM schedules + layer-20 block counts are recomputed INSIDE the
+graph from the step's device seq_lens (dg_schedule runs inside the graph).
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+import torch
+import torch.nn.functional as F
+
+PHYS = os.environ.get("PHYS_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("IDX2F_CANON_STOCK", "1")   # (engine.py sets it too) canonical stock top-k order
+IDX = os.path.join(PHYS, "kernels/indexer2f")
+if IDX not in sys.path:
+    sys.path.insert(0, IDX)
+
+LAYERS = (2, 8, 14, 20, 24, 28, 32, 36)
+KV_SOURCES = (2, 8, 14, 20)
+RATIO = {2: 2, 8: 2, 14: 2, 20: 1, 24: 1, 28: 1, 32: 1, 36: 1}
+K_SOURCE = {2: 2, 8: 8, 14: 14, 20: 20, 24: 20, 28: 20, 32: 20, 36: 20}
+RING_LAYERS = (2, 8, 14)          # state pool slot = 3 x [8, 1024] fp32, in this order (geometry.STATE_SLOT_BYTES)
+IDLE_DEV_BT = os.environ.get("ENG_IDLE_DEVBT", "1") == "1"      # idle ranks use the device block-table path too
+POP_IDX_FIRST = os.environ.get("ENG_POP_IDX", "1") == "1"        # free the previous step's indexer state first
+USE_PLAN_BOUNDS = os.environ.get("ENG_PLAN_BOUNDS", "1") == "1"   # eager host path: plan_bounds + persistent bmax
+TOPK_WS_PER_DEV = os.environ.get("ENG_TOPK_WS_PER_DEV", "1") == "1"   # CORRECTNESS (default on): vLLM's
+                                 # stock top-k (idx2f.stock_topk: long rows past 262,144 positions and the non-fast modes,
+                                 # graphed long variants and eager) takes its 1 MB radix workspace from vLLM's ONE global
+                                 # WorkspaceManager, which X._workspace() created on the FIRST device: every rank's persistent /
+                                 # cooperative top-k ran on that one device-0 buffer at once (persistent kernels coordinate their
+                                 # CTAs through it). One manager per device instead: workspace allocated here, outside any
+                                 # capture, then locked (a growth request asserts instead of freeing a buffer graphs point at).
+ONEBK_SHARE = os.environ.get("ENG_IDX_ONEBK_SHARE", "1") == "1"   # (c128-attn 15 Nov, default on; only acts with the
+    # engine's ENG_MIX_ONE_BUCKET): the cached view states of a pinned base bucket (the view's base: max A, or max T with
+    # ENG_MIX_ONE_BUCKET_T) share that base's ONE tables2f.GeneralTables set (device tables, block-table rows, the lean
+    # OwnedIndexer's cand / top-512, lat) instead of one per view. Families are found by base, so A and T views never
+    # share a set (carry_candidates copies between two different sets, as it must)
+    # (~22 KB per row each, kept forever: >= 321 MiB per GPU at 22 views in B4b's soak). Per view only its R-row
+    # prefixes, its pos and its own idx2f_tab registration (pointers): the derive kernel writes exactly what it writes for
+    # a plain R bucket, so the same bits (Idx2f._general_tables)
+CAND_PAD_FIX = os.environ.get("ENG_CAND_PAD_FIX", "1") == "1"   # tail bucket: padding IR rows get their group's cand
+# ENG_IDX_CARRY_ASC=1 (default; c128-attn / FPR 15 Nov): carry_candidates also carries layer 20's list order. With a
+# row past LONG_ROW in A, A's layer 20 takes the stock select for ALL its rows (score order, cand_ascending False); T's
+# indexer starts every step ascending, so short T rows took cand_prep2 (ascending lists only) on score-ordered lists:
+# wrong unions / slots for layers 24-36 (Python _consumer_ws and the native idx step, both read oi.cand_ascending).
+# 0 = the old behaviour (A/B only).
+CARRY_ASC = os.environ.get("ENG_IDX_CARRY_ASC", "1") == "1"
+# ENG_IDX_LONG_SCRATCH_FULL=1 (c1-tail 19 Nov, fix A precapture headroom; A/B / rollback only): the long-row variants' shared
+# fp32 logits scratch sized up front as max decode bucket x LEVEL_CTX[-1] (the old rule: ~604 MiB per GPU at ~240 rows).
+# Default 0: sized to the largest R x bound of the long variants actually created (fix A: R 4 x 524,288 = 8 MiB); see
+# _long_scratch. Bitwise either way (pure workspace: same contiguous [R, bound] view at offset 0 of a fresh allocation).
+LONG_SCRATCH_FULL = os.environ.get("ENG_IDX_LONG_SCRATCH_FULL", "0") == "1"
+LEVEL_CTX = (262_144, 524_288, 655_360)   # decode-graph bound per long-row level: lvl 0 = idx2f fast
+                                          # mode everywhere; lvl 1 = ratio-2 layers fast, layer 20 + its consumers stock
+                                          # select / top-k; lvl 2 = all stock (max_model_len). Same per-layer rule as eager.
+LONG_ANY_ROWS = os.environ.get("FPR_LONG_ANY_ROWS", "0") == "1"   # Clariden (engine.py LONG_ANY_ROWS)
+MAX_CTX = 262_144                 # idx2f fast top-k / select limit (rows up to 262,144 compressed positions); the engine
+                                  # refuses longer sequences in this mode
+P_MAX = 655_360 // 64             # block-table width (production's max_model_len / 64)
+NU_MAX = 4096                     # upload v2: block-table delta entries per rank and decode step in the blob (more: per tensor)
+# Lever (a), the HBM index-key mirror (c128-attn, 13 Nov 2026; FPR_KV_IDX_MIRROR=<slots>, default 0 = off; tiered pools only):
+# host-tier pages of decode sequences get a mirror slot in HBM (22,464 B = the 4 sources' index-key span of a 64-token page),
+# keyed per (state slot, block). The lvl-0 decode buckets' indexer reads them there (idx2f_fcand8m / fcandm: block-table
+# entries | idx2f.MIRROR_BIT); FlashMLA / GlobalOut keep the pool block table d["bt"]. Bytes: the in-graph refresh
+# (idx2f_mirror.cu: each sequence's mirrored pages of positions [wm, L) from the pool, then wm = L) + a second index-key
+# store into the mirror for the bucket's own new records; the host maps / unmaps from the block-table deltas and lowers wm.
+MIRROR_SLOTS = int(os.environ.get("FPR_KV_IDX_MIRROR", "0") or 0)
+# debug (FPR's suggestion, 14 Nov): every N-th decode touch, verify the mirror on the device (host sync; read-only): for every
+# (state slot, block) the host map holds, dbt == the map's page, mdbt == slot | MIRROR_BIT when mapped else == dbt, and the
+# mapped pages entirely below wm hold the pool's bytes. Mismatches are logged with (slot, block) and counted in stats.
+MIRROR_CHECK = int(os.environ.get("FPR_KV_IDX_MIRROR_CHECK", "0") or 0)
+
+
+class IdxMirror:
+    """One rank's index-key mirror (see MIRROR_SLOTS)."""
+
+    def __init__(self, pool, PB: int, PO: dict, RPP: dict, dbt: torch.Tensor, layout: dict, log=print):
+        import numpy as np
+        import idx2f as X
+        srcs = sorted(RPP)
+        self.ib = min(PO[f"idx{s}"] for s in srcs)
+        self.span = span = max(PO[f"idx{s}"] + layout[f"idx{s}"] for s in srcs) - self.ib
+        assert span == sum(layout[f"idx{s}"] for s in srcs) and span % 16 == 0 and self.ib % 16 == 0, (self.ib, span)
+        assert int(getattr(pool, "n_hbm_pages", pool.n_paged)) < pool.n_paged, "FPR_KV_IDX_MIRROR: tiered pools only"
+        if hasattr(pool, "idxmirror"):   # the worker's (inside its budget; None = no mirror on this rank)
+            buf = pool.idxmirror
+            assert buf is not None, "FPR_KV_IDX_MIRROR: the worker allocated no mirror (pure host pools?)"
+        else:   # tests / an older worker.py: from what is free after the pools
+            buf = torch.empty(MIRROR_SLOTS * span, dtype=torch.uint8, device=pool.paged.device)
+        self.M = M = buf.numel() // span
+        self.mir = buf[:M * span].view(M, span)
+        self.pool_span = torch.as_strided(pool.paged, (pool.n_paged, span), (PB, 1), self.ib)
+        self.kv = {s: torch.as_strided(buf, (M, RPP[s], 1, 132), (span, 132, 132, 1), PO[f"idx{s}"] - self.ib) for s in srcs}
+        self.kvs = {s: torch.as_strided(buf, (M, RPP[s], 132), (span, 132, 1), PO[f"idx{s}"] - self.ib) for s in srcs}
+        self.mdbt = torch.zeros_like(dbt)                     # dbt with the mapped entries = mirror slot | MIRROR_BIT
+        self.dbt = dbt
+        self.wm = torch.zeros(dbt.shape[0], dtype=torch.int32, device=dbt.device)
+        self.n_hbm = int(pool.n_hbm_pages)
+        self.slot = np.full(tuple(dbt.shape), -1, np.int32)  # host: mirror slot per (state slot, block)
+        self.page = np.full(tuple(dbt.shape), -1, np.int32)  # host: the pool page the device table holds there
+        self.free = list(range(M - 1, -1, -1))
+        self.bit = X.MIRROR_BIT
+        self.ext = X.ext_mirror()
+        self.stats = dict(deltas=0, mapped=0, full=0, resets=0, reclaimed=0)
+        self.log = log
+        self.step = 0
+        self.seen = np.full(dbt.shape[0], -(1 << 30), np.int64)   # host: last decode step a state slot ran in a bucket
+        self.nmap = np.zeros(dbt.shape[0], np.int64)             # host: mapped blocks per state slot
+        log(f"idx mirror: {M:,} slots x {span:,} B = {M * span / 1e9:.2f} GB on {buf.device} (host-tier pages from "
+            f"{self.n_hbm:,}; per-page select in idx2f_fcand8m / fcandm)")
+
+    def touch(self, sslots) -> None:
+        """A decode step's state slots (host, at upload): the reclamation's recency."""
+        self.step += 1
+        self.seen[sslots] = self.step
+        if MIRROR_CHECK and self.step % MIRROR_CHECK == 0:
+            self.check()
+
+    def check(self) -> bool:
+        """FPR_KV_IDX_MIRROR_CHECK (debug): the host map vs dbt / mdbt, and the fresh mirror bytes vs the pool (MIRROR_CHECK
+        above); on the current stream, synchronizing. True = consistent."""
+        import numpy as np
+        dev = self.mdbt.device
+        st, bl = np.nonzero(self.page >= 0)
+        self.stats["checks"] = self.stats.get("checks", 0) + 1
+        if not len(st):
+            return True
+        sd = torch.from_numpy(st.astype(np.int64)).to(dev)
+        bd = torch.from_numpy(bl.astype(np.int64)).to(dev)
+        pg = torch.from_numpy(self.page[st, bl]).to(dev)
+        sl = torch.from_numpy(self.slot[st, bl]).to(dev)
+        d_ = self.dbt[sd, bd]
+        m_ = self.mdbt[sd, bd]
+        mapped = sl >= 0
+        bad_d = d_ != pg
+        bad_m = torch.where(mapped, m_ != (sl | self.bit), m_ != d_)
+        fresh = (mapped & ((bd + 1) * 64 <= self.wm.index_select(0, sd).long())).nonzero().flatten()
+        bad_c = torch.zeros(len(st), dtype=torch.bool, device=dev)
+        for i in range(0, fresh.numel(), 2048):
+            c = fresh[i:i + 2048]
+            a = self.pool_span.index_select(0, d_.index_select(0, c).long())
+            b = self.mir.index_select(0, sl.index_select(0, c).long())
+            bad_c.index_fill_(0, c[(a != b).any(1)], True)
+        n = [int(x.sum()) for x in (bad_d, bad_m, bad_c)]
+        if any(n):
+            self.stats["check_bad"] = self.stats.get("check_bad", 0) + 1
+            ex = {k: [(int(st[j]), int(bl[j])) for j in x.nonzero().flatten()[:5].tolist()]
+                  for k, x in (("dbt!=map", bad_d), ("mdbt", bad_m), ("bytes", bad_c))}
+            self.log(f"idx mirror CHECK FAIL {dev} step {self.step}: {len(st):,} entries ({int(mapped.sum()):,} mapped, "
+                     f"{fresh.numel():,} fresh pages compared): dbt != map {n[0]}, mdbt wrong {n[1]}, stale bytes {n[2]}; "
+                     f"first (slot, block): {ex}")
+            return False
+        if self.stats["checks"] % 50 == 1:
+            self.log(f"idx mirror check {dev} step {self.step}: OK ({len(st):,} entries, {int(mapped.sum()):,} mapped, "
+                     f"{fresh.numel():,} fresh pages compared)")
+        return True
+
+    def _reclaim(self, need: int) -> None:
+        """Free mirror slots of state slots not seen in a decode bucket for 2+ steps (their sequences finished, wait or
+        prefill: the delta stream never says), oldest first, until `need` are free; their device entries go back to the
+        pool page ids (a sequence that decodes again reads the pool until new deltas map it), on the current stream."""
+        import numpy as np
+        cand = np.nonzero((self.nmap > 0) & (self.seen < self.step - 1))[0]
+        if not len(cand):
+            return
+        rows_, cols_ = [], []
+        for st in cand[np.argsort(self.seen[cand])].tolist():
+            m = self.slot[st] >= 0
+            js = np.nonzero(m)[0]
+            self.free.extend(self.slot[st, js].tolist())
+            self.slot[st, js] = -1
+            self.nmap[st] = 0
+            rows_.append(np.full(len(js), st, np.int64))
+            cols_.append(js.astype(np.int64))
+            self.stats["reclaimed"] += len(js)
+            if len(self.free) >= need:
+                break
+        r_, c_ = np.concatenate(rows_), np.concatenate(cols_)
+        dev = self.mdbt.device
+        pin = lambda a: torch.from_numpy(np.ascontiguousarray(a)).pin_memory().to(dev, non_blocking=True)  # noqa: E731
+        self.mdbt.index_put_((pin(r_), pin(c_)), pin(self.page[r_, c_].astype(np.int32)))
+
+    def reset(self) -> None:
+        import numpy as np
+        self.nmap[:] = 0
+        self.seen[:] = -(1 << 30)
+        self.mdbt.zero_()
+        self.wm.zero_()
+        self.slot.fill(-1)
+        self.page.fill(-1)
+        self.free = list(range(self.M - 1, -1, -1))
+
+    def deltas(self, rows, cols, pages, upd_slot, upd_start) -> None:
+        """Block-table deltas (rows = state slots, cols = blocks, pages = pool pages; numpy) on the current stream.
+        FPR (13 Nov): every served table change is a delta; a new incarnation in a slot always starts with a block-0 delta
+        (possibly 0 long); several builders (tb, tb_tail, D13's fallback) re-send identical pages; pages never change
+        mid-table for a running sequence without a new incarnation; a page's tier is fixed while a sequence holds it.
+        Hence: appended / re-sent entries with the SAME page at the same (slot, block) are no-ops (no free + refill, no wm
+        change); a block-0 delta = a possibly new incarnation: wm = 0 (every mapped page refreshed before it is read: a
+        freed page id can return at the same block with other bytes), the slot keeps its mirror slots for unchanged page ids
+        and frees everything past the new table's end."""
+        import numpy as np
+        if not len(rows) and not len(upd_slot):
+            return
+        rows = np.asarray(rows, np.int64)
+        cols = np.asarray(cols, np.int64)
+        pages = np.asarray(pages, np.int32)
+        self.stats["deltas"] += 1
+        wmv = {}
+        sl0 = np.asarray(upd_slot, np.int64)
+        a0 = np.asarray(upd_start, np.int64)
+        for st in np.unique(sl0[a0 == 0]).tolist():   # new incarnations: everything past the new table's end goes
+            cs_ = cols[rows == st]
+            nb = int(cs_.max()) + 1 if len(cs_) else 0   # the new table's length (all of this call's entries of st)
+            old = self.slot[st, nb:]
+            m = old >= 0
+            if m.any():
+                self.free.extend(old[m].tolist())
+                old[m] = -1
+                self.nmap[st] -= int(m.sum())
+            self.page[st, nb:] = -1
+            wmv[st] = 0
+            self.stats["resets"] += 1
+        same = self.page[rows, cols] == pages
+        ch = ~same
+        if ch.any():
+            r_, c_, p_ = rows[ch], cols[ch], pages[ch]
+            old = self.slot[r_, c_]
+            m = old >= 0
+            if m.any():
+                self.free.extend(old[m].tolist())
+                self.slot[r_[m], c_[m]] = -1
+                np.subtract.at(self.nmap, r_[m], 1)
+            self.page[r_, c_] = p_
+            for st, c in zip(r_.tolist(), c_.tolist()):
+                wmv[st] = min(wmv.get(st, 1 << 30), 64 * c)
+            host = np.nonzero(p_ >= self.n_hbm)[0]
+            if len(host) > len(self.free):
+                self._reclaim(len(host))
+            k = min(len(host), len(self.free))
+            if k:
+                hi = host[:k]
+                sl = np.asarray(self.free[len(self.free) - k:][::-1], np.int32)
+                del self.free[len(self.free) - k:]
+                self.slot[r_[hi], c_[hi]] = sl
+                np.add.at(self.nmap, r_[hi], 1)
+                self.stats["mapped"] += k
+            self.stats["full"] += len(host) - k
+        if not ch.any() and not wmv:
+            return
+        dev = self.mdbt.device
+        pin = lambda a: torch.from_numpy(np.ascontiguousarray(a)).pin_memory().to(dev, non_blocking=True)  # noqa: E731
+        if ch.any():   # mdbt = the encoded entries of the changed blocks
+            sl_ = self.slot[r_, c_]
+            vals = np.where(sl_ >= 0, sl_ | self.bit, p_).astype(np.int32)
+            self.mdbt.index_put_((pin(r_), pin(c_)), pin(vals))
+        if self.stats["deltas"] % 500 == 1:   # (occupancy, so a run shows the mirror engaged)
+            self.log(f"idx mirror {dev}: {self.M - len(self.free):,} / {self.M:,} slots in use; {self.stats}")
+        if not wmv:
+            return
+        st = np.fromiter(wmv.keys(), np.int64, len(wmv))
+        lo = np.fromiter(wmv.values(), np.int32, len(wmv))
+        sd = pin(st)
+        self.wm.index_copy_(0, sd, torch.minimum(self.wm.index_select(0, sd), pin(lo)))
+
+
+def _up_fields(R: int, B: int):
+    """upload v2: the decode bucket's per-step indexer inputs in one blob (8-byte aligned fields)."""
+    return (("sl1", "int32", B * 4), ("sl2", "int32", B * 4), ("cs1", "int64", R), ("cs2", "int64", R),
+            ("rs", "int64", R), ("valid", "bool", R), ("pslot", "int64", B), ("du_rows", "int64", NU_MAX),
+            ("du_cols", "int64", NU_MAX), ("du_pages", "int32", NU_MAX))
+
+
+def _up_bytes(R: int, B: int) -> int:
+    import numpy as np
+    return sum(-(-(n * np.dtype(dt).itemsize) // 8) * 8 for _, dt, n in _up_fields(R, B))
+
+
+def _up_views(blob, R: int, B: int, numpy: bool = False) -> dict:
+    import numpy as np
+    out, off = {}, 0
+    tdt = dict(int64=torch.int64, int32=torch.int32, bool=torch.bool)
+    src = blob.numpy() if numpy else blob
+    for nm, dt, n in _up_fields(R, B):
+        nb = n * np.dtype(dt).itemsize
+        x = src[off: off + nb]
+        out[nm] = x.view(dt) if numpy else x.view(tdt[dt])
+        off += -(-nb // 8) * 8
+    out["_bytes"] = off
+    return out
+EPS = 1e-20
+# Indexer decode-step cuts, each bitwise == the unfused chain (top-512 == production), all default off; module flags
+# read per bucket alloc / per step (tests switch them per arm):
+#  IDX_FUSE: decode buckets (level 0): the top-k writes FlashMLA's global slots / lengths (oi.fuse + GlobalOut): no
+#            compute_global_topk_indices_and_lens / copies / nb_lens kernels; layers off the fast path fall back inside
+#            OwnedIndexer.layer (global_topk)
+#  IDX_SIDE: decode buckets: the kv-source compressor chain + weights_proj on a side branch (fork / join before the q
+#            RoPE / quant; torch.mm(x, wp.t(), out) == F.linear bitwise), next to the wq_b GEMM
+#  IDX_F8:   idx2f's logits kernel family "f8" (idx2f_fcand8.cu: dense + candidate logits, same DeepGEMM arithmetic);
+#            the engine sets idx2f.LOGITS per step (default: IDX2F_LOGITS=f8 in the env)
+IDX_FUSE = os.environ.get("ENG_IDX_FUSE", "0") == "1"
+IDX_SIDE = os.environ.get("ENG_IDX_SIDE", "0") == "1"
+IDX_F8 = os.environ.get("ENG_IDX_F8", "0") == "1" or os.environ.get("IDX2F_LOGITS", "") == "f8"
+
+
+def patch_multidevice(X) -> None:
+    """idx2f_cand.cu raises its kernels' dynamic-smem limit once per PROCESS (static bool), so devices 1..3 of a one-process
+    4-GPU engine launch with the default limit (cudaErrorInvalidValue). Until idx2f_cand.cu makes it per-device: build
+    a copy of its CURRENT source with only that guard per device (eng_idx2f_cand, engine/build) and point
+    idx2f.ext_cand at it. Kernels and launch arguments are unchanged."""
+    import functools
+    from pathlib import Path
+    src = (Path(X.HERE) / "idx2f_cand.cu").read_text()
+    old = "static bool set = false;"
+    if src.count(old) == 0:
+        return                                     # fixed upstream
+    new = "static bool set_dev_[64] = {}; int dev_ = 0; cudaGetDevice(&dev_); bool& set = set_dev_[dev_];"
+    out = Path(PHYS) / "engine" / "build" / "eng_idx2f_cand.cu"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    txt = "// GENERATED by engine/hooks_idx.py patch_multidevice from kernels/indexer2f/idx2f_cand.cu (per-device smem\n" \
+          "// attribute guard only). Do not edit.\n" + src.replace(old, new)
+    if not out.exists() or out.read_text() != txt:
+        out.write_text(txt)
+    X.ext_cand = functools.cache(lambda: X._load("eng_idx2f_cand", str(out), X.DG_FLAGS,
+                                                 [str(X.deep_gemm_include()), str(X.HERE)]))
+
+
+def build_idx_weights(L: int):
+    """CPU builder (wcache key eng_idxw_L{L}_v1): comp2f.load_weights without the fp32 copies and the RoPE table."""
+    import comp2f
+    W = comp2f.load_weights(L, "cpu")
+    W.pop("f32", None)
+    W.pop("cos_sin", None)
+    return W
+
+
+_GTV: list = []   # [GtView class], defined at the first view (tables2f is imported lazily)
+
+
+def _gt_view(core, s: dict):
+    """ENG_IDX_ONEBK_SHARE: the tables2f.GeneralTables of view state s over the onebk core's buffers (Idx2f._general_tables)."""
+    if not _GTV:
+        import tables2f as T2
+
+        class GtView(T2.GeneralTables):
+            """A GeneralTables that allocates nothing: the core's tensors, with the row-led ones ([R] / [R + 2] / [R, 512])
+            as the view's R-row prefixes, the view's own pos (the engine's per-view s["pos"]) and its own registration
+            (idx2f_tab.create: host pointers; R = pos.numel()). The pseudo-request tables ([IRc]), the block-table rows
+            ([Bc, P_MAX]) and the lean OwnedIndexer are the core's (rows_view(B) per step, as for a plain bucket)."""
+
+            def __init__(self, core, s):     # no GeneralTables.__init__: nothing is allocated
+                self._core, self._s = core, s
+                self._bind()
+
+            def _bind(self) -> None:
+                core, s = self._core, self._s
+                R, pos = int(s["R"]), s["pos"]
+                assert R <= core.R and pos.numel() == R and pos.dtype == torch.int64 and pos.is_contiguous(), \
+                    ("onebk GtView", R, core.R, tuple(pos.shape), pos.dtype)
+                for k, val in core.__dict__.items():
+                    if not k.startswith("_"):
+                        setattr(self, k, val)
+                self.R, self.pos = R, pos
+                self.lat = core.lat[:R]
+                self.cs = {c: core.cs[c][:R] for c in (1, 2)}
+                self.rs, self.t2r, self.vir, self.vrow = core.rs[:R], core.t2r[:R], core.vir[:R], core.vrow[:R]
+                self.row2ir_d, self.qsl = core.row2ir_d[:R], core.qsl[:R + 2]
+                t = [self.pos, self.dbt, self.sl[1], self.sl[2], self.cs[1], self.cs[2], self.rs, self.valid_ir,
+                     self.t2r, self.qsl, self.ir2row_c, self.vir, self.vrow, self.row2ir_d, self.nb_lens, self.bt]
+                self.hid = self.stage.E.create(t, 1)   # idx2f_tab.create: one ~180-B host Handle (pointers) in a
+                # process-global vector, no device memory and no CUDA object, and no destroy entry: a rebind (core growth
+                # or re-carve) leaves the old one unused, as GeneralTables._alloc's own growth does
+                self._keep, self._core_bt = t, core.bt
+
+            def _alloc(self, Bc: int) -> None:   # GeneralTables.upload with B > Bc: grow the SHARED set, then rebind
+                self._core._alloc(Bc)
+                self._bind()
+
+        _GTV.append(GtView)
+    return _GTV[0](core, s)
+
+
+class Idx2f:
+    """Owned-sequence indexer + compressor for one engine (all ranks)."""
+
+    def __init__(self, eng, mode: str = "fast", logits: str | None = None):
+        import idx2f as X
+        sys.path.insert(0, os.path.join(PHYS, "tools"))
+        from wcache import cached
+        self.X, self.eng, self.mode = X, eng, mode
+        lg = getattr(X, "LOGITS", None)
+        self._logits0 = None if lg is None else ("cand" if lg == "f8" else lg)   # IDX_F8 off: idx2f's import-time family
+        # dense index logits: DeepGEMM works on one device of a process only; idx2f's own exact kernel
+        # (OwnedIndexer.dense_impl = "idx2f", bit-identical to DeepGEMM) on every device; engine Triton = fallback
+        has_idx2f_dense = "dense_impl" in getattr(X.OwnedIndexer, "__dataclass_fields__", {})
+        self.logits_impl = logits if logits else (("idx2f" if has_idx2f_dense else "triton") if len(eng.devs) > 1
+                                                  else "deepgemm")
+        if len(eng.devs) > 1:
+            patch_multidevice(X)
+        if self.logits_impl == "triton":
+            # DeepGEMM's JIT kernels are bound to the first device's context in a multi-GPU process (idx_logits.py doc)
+            from . import idx_logits as IL
+
+            def _logits(q, ck, weights, seq_lens, width, sched=None):
+                return IL.paged_mqa_logits(q, ck.kv, weights, seq_lens, ck.block_table, ck.block_size, width)
+            X.dg_logits = _logits
+            X.dg_schedule = lambda seq_lens, block_size: None
+        self.dbg = {}     # tests: ("ks" | "q8" | "wo", L) -> captured tensors [R, ...] replacing our GEMM outputs (replay)
+        self._wrap_dense_logits(X)
+        self._wrap_stock_topk(X, eng)
+        # mixed-step tables: "host" (upload_general below), "device" (kernels/indexer2f tables2f.GeneralTables: the same dict
+        # derived on the device from one staging copy, no host sync, persistent OwnedIndexer), "check" (both, compared
+        # on every step, the host dict used)
+        self.lean = os.environ.get("ENG_IDX_LEAN", "1") == "1"   # eager host path: idx2f lean indexer + EagerWorkspace
+        self.tables = os.environ.get("ENG_IDX_TABLES", "device")   # == host tables bitwise
+        assert self.tables in ("host", "device", "check"), self.tables
+        self.checked = dict(steps=0, mismatch=0, fallback=0)
+        self.W = []
+        for r, dev in enumerate(eng.devs):
+            with torch.cuda.device(dev):
+                X._workspace(dev)
+                per = {}
+                for L in LAYERS:
+                    if L not in eng.layers:
+                        continue
+                    w = cached(f"eng_idxw_L{L}_v1", lambda L=L: build_idx_weights(L), device=dev, verbose=False)
+                    w["cos_sin"] = eng.glob[r]["cos_sin"][RATIO[L]]
+                    per[L] = w
+                self.W.append(per)
+        from geometry import PAGE_BYTES, PAGE_OFFSETS, RECORDS_PER_PAGE, STATE_SLOT_BYTES
+        self.PB, self.PO, self.RPP, self.SSB = PAGE_BYTES, PAGE_OFFSETS, RECORDS_PER_PAGE, STATE_SLOT_BYTES
+        self.views = []
+        if getattr(eng, "pools", None) is not None:
+            self.attach(eng.pools)
+
+    def _wrap_stock_topk(self, X, eng) -> None:
+        """TOPK_WS_PER_DEV: idx2f.stock_topk with vLLM's workspace manager of the logits' own device (see the flag)."""
+        if not TOPK_WS_PER_DEV or getattr(X, "_eng_topk_wrapped", False) or not hasattr(X, "stock_topk"):
+            return
+        from vllm.model_executor.layers import indexer_topk as IT
+        from vllm.v1.worker import workspace as WS
+        for dev in eng.devs:                 # the process-global manager exists before the canary below (idempotent)
+            with torch.cuda.device(torch.device(dev)):
+                X._workspace(torch.device(dev))
+        mgrs = {}
+        for dev in eng.devs:
+            d = torch.device(dev)
+            with torch.cuda.device(d):
+                m = WS.WorkspaceManager(d)
+                m.get_simultaneous(((IT.RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8))
+                m.lock()
+            mgrs[d.index] = m
+        orig = X.stock_topk
+
+        def stock_topk(logits, seq_lens, out, max_seq_len, backend="persistent"):
+            m = mgrs.get(logits.device.index)
+            if m is None:
+                return orig(logits, seq_lens, out, max_seq_len, backend)
+            prev = WS._manager
+            WS._manager = m
+            try:
+                return orig(logits, seq_lens, out, max_seq_len, backend)
+            finally:
+                WS._manager = prev
+        X.stock_topk = stock_topk
+        X._eng_topk_wrapped = True
+        self.topk_ws = mgrs
+        # canary: the process-global manager (device 0) refuses requests from another current device, so any vLLM path
+        # that still reaches it from rank 1..3 fails loudly instead of silently sharing device 0's scratch
+        g = getattr(WS, "_manager", None)
+        if g is not None and not getattr(g, "_eng_canary", False):
+            gs = g.get_simultaneous
+
+            def guarded(*a, **k):
+                cur = torch.cuda.current_device()
+                if g._device.index is not None and cur != g._device.index:
+                    raise AssertionError(f"vLLM workspace manager of {g._device} used from cuda:{cur} ("
+                                         f"TOPK_WS_PER_DEV canary: a cross-device workspace)")
+                return gs(*a, **k)
+            g.get_simultaneous = guarded
+            g._eng_canary = True
+
+    def _wrap_dense_logits(self, X) -> None:
+        """Eager steps: idx2f's dense logits [rows, width] fp32 go into ONE workspace per device (idx2f slices each call to
+        its logits_budget, 1 GB) instead of a fresh tensor per call, whose width grows with every chunk of a long prompt
+        (the caching allocator then never reuses the old blocks: tens of GB cached on the rank with the long prompts).
+        The logits of a call are consumed (block max / top-k / select) before the next call on the same stream; nothing
+        keeps them (OwnedIndexer.keep_logits False). Graph captures keep the original (graph-pool) allocation."""
+        if getattr(X, "_eng_ws_wrapped", False) or not hasattr(X, "dense_logits") or \
+                (os.environ.get("ENG_IDX_LEAN", "1") == "1" and hasattr(X, "EagerWorkspace")):
+            return
+        orig = X.dense_logits
+        ws = {}
+
+        def dense_logits(q, ck, weights, seq_lens, width, out=None, **kw):
+            rows = q.shape[0] * q.shape[1]
+            need = rows * int(width)
+            if out is not None or kw or not getattr(X, "_eng_ws_on", True) or torch.cuda.is_current_stream_capturing() or \
+                    getattr(ck, "kvm", None) is not None or \
+                    getattr(X.OwnedIndexer, "keep_logits", False) is True:
+                return orig(q, ck, weights, seq_lens, width, **({"out": out} if out is not None else {}), **kw)
+            dev = q.device.index
+            buf = ws.get(dev)
+            if buf is None or buf.numel() < need:
+                ws.pop(dev, None)
+                budget = int(getattr(X.OwnedIndexer, "logits_budget", 1 << 30))
+                buf = ws[dev] = torch.empty(max(need, budget // 4 + (1 << 20)), dtype=torch.float32, device=q.device)
+            out = buf[:need].view(rows, int(width))
+            X.ext_cand().logits_dense(q, ck.kv, weights, seq_lens.reshape(-1), ck.block_table, out)
+            return out
+        X.dense_logits = dense_logits
+        X._eng_ws_wrapped = True
+        self.logits_ws = ws
+
+    def attach(self, pools) -> None:
+        """Views of the rank's pools: comp / idx pages of the 4 sources (packed page), the 3 rings (state pool)."""
+        self.views = []
+        for r, p in enumerate(pools):
+            v = {}
+            for s in KV_SOURCES:
+                rpp = self.RPP[s]
+                v[f"comp{s}"] = torch.as_strided(p.paged, (p.n_paged, rpp, 584), (self.PB, 584, 1), self.PO[f"comp{s}"])
+                v[f"idx{s}"] = torch.as_strided(p.paged, (p.n_paged, rpp, 1, 132), (self.PB, 132, 132, 1), self.PO[f"idx{s}"])
+                v[f"idxs{s}"] = torch.as_strided(p.paged, (p.n_paged, rpp, 132), (self.PB, 132, 1), self.PO[f"idx{s}"])
+            st32 = p.state.view(torch.float32).view(p.n_state, len(RING_LAYERS), 8, 1024)
+            for i, s in enumerate(RING_LAYERS):
+                v[f"ring{s}"] = st32[:, i]
+            # serve D12: persistent per-state-slot block table, updated from the tables' deltas every step
+            v["dbt"] = torch.zeros(p.n_state, P_MAX, dtype=torch.int32, device=p.paged.device)
+            self.views.append(v)
+        self.mir = []
+        if MIRROR_SLOTS > 0:
+            from geometry import PAGE_LAYOUT
+            if all(hasattr(p, "idxmirror") and p.idxmirror is None for p in pools):
+                getattr(self.eng, "log", print)("idx mirror: FPR_KV_IDX_MIRROR set but the worker allocated none "
+                                                "(pure host / untiered pools): off")
+            else:
+                for r, p in enumerate(pools):
+                    with torch.cuda.device(p.paged.device):
+                        self.mir.append(IdxMirror(p, self.PB, self.PO, self.RPP, self.views[r]["dbt"], PAGE_LAYOUT,
+                                                  getattr(self.eng, "log", print)))
+
+    def mirror_deltas(self, r: int, rows, cols, pages, upd_slot, upd_start) -> None:
+        """Lever (a): the step's block-table deltas of rank r (numpy) into its mirror map (current stream)."""
+        if getattr(self, "mir", None):
+            self.mir[r].deltas(rows, cols, pages, upd_slot, upd_start)
+
+    def mirror_reset(self) -> None:
+        for m in getattr(self, "mir", None) or []:
+            m.reset()
+
+    def _mirror_seq_deltas(self, r: int, tab) -> None:
+        """Lever (a): a RankTables' block-table deltas (seq bt_upd_*) into the mirror map, for the paths that apply them to
+        dbt without apply_deltas: tables2f.GeneralTables (mixed steps' device tables) and _upload_v2's blob. Without it a
+        sequence admitted by a mixed step decodes through a stale (or zero) mirror table."""
+        if not getattr(self, "mir", None) or tab is None or not tab.n:
+            return
+        sq = getattr(tab, "seq", None) or {}
+        if "bt_upd_seq" not in sq:
+            return
+        import numpy as np
+        ks, s0, ln = sq["bt_upd_seq"].tolist(), sq["bt_upd_start"].tolist(), sq["bt_upd_len"].tolist()
+        if not ks:
+            return
+        slots = sq["state_slot"]
+        us = [int(slots[k]) for k in ks]
+        nu = int(sum(ln))
+        if not nu:   # zero-length block-0 deltas: resets
+            self.mirror_deltas(r, np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.int32), us, s0)
+            return
+        rows = np.repeat(np.asarray(us, np.int64), ln)
+        cols = np.concatenate([np.arange(a_, a_ + n_, dtype=np.int64) for a_, n_ in zip(s0, ln)])
+        self.mirror_deltas(r, rows, cols, sq["bt_upd_pages"].numpy()[:nu].astype(np.int32), us, s0)
+
+    def apply_deltas(self, r: int, tab) -> bool:
+        """RankTables block-table deltas (seq bt_upd_*) -> the rank's device table. False: tables without deltas."""
+        sq = getattr(tab, "seq", None) or {}
+        if "bt_upd_seq" not in sq:
+            return False
+        if not tab.n:
+            # an idle rank with delta tables still takes the device-table path: a decode graph captured on an idle rank
+            # must contain the per-slot table gather (its `dev_bt` branch is fixed at capture time), else its later
+            # replays with real rows read a never-refreshed (zero) block table (symptom: the first sequence of a process
+            # right, every later one on a rank idle at capture wrong)
+            return IDLE_DEV_BT
+        ks, s0, ln = sq["bt_upd_seq"].tolist(), sq["bt_upd_start"].tolist(), sq["bt_upd_len"].tolist()
+        pages = sq["bt_upd_pages"]
+        slots = sq["state_slot"]
+        if getattr(self, "mir", None) and ks and not sum(ln):   # lever (a): zero-length block-0 deltas reset the mirror too
+            import numpy as np
+            self.mirror_deltas(r, np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.int32),
+                               [int(slots[k]) for k in ks], s0)
+        if not ks or not sum(ln):
+            return True
+        rows, cols = [], []
+        for k, a_, n_ in zip(ks, s0, ln):
+            rows += [int(slots[k])] * n_
+            cols += list(range(a_, a_ + n_))
+        dbt = self.views[r]["dbt"]
+        dev = dbt.device
+        dbt.index_put_((torch.tensor(rows).to(dev, non_blocking=True), torch.tensor(cols).to(dev, non_blocking=True)),
+                       pages.to(torch.int32).pin_memory().to(dev, non_blocking=True))
+        if getattr(self, "mir", None):
+            self.mirror_deltas(r, rows, cols, pages.to(torch.int32).numpy(), [int(slots[k]) for k in ks], s0)
+        return True
+
+    # ---- per bucket device state
+    def alloc(self, r: int, s: dict) -> None:
+        X, dev, R = self.X, s["dev"], s["R"]
+        assert R % 4 == 0, "idx2f hook: decode buckets only (R = 4 x sequences)"
+        B = R // 4
+        i32, i64 = torch.int32, torch.int64
+        with torch.cuda.device(dev):
+            if self.eng.cfg.upload_v2:   # the per-step inputs as views of one device blob (one H2D copy per rank)
+                up_d = torch.zeros(_up_bytes(R, B), dtype=torch.uint8, device=dev)
+                uv = _up_views(up_d, R, B)
+                uv["cs1"].fill_(-1)
+                uv["cs2"].fill_(-1)
+                uv["rs"].fill_(-1)
+                d = dict(B=B, bt=torch.zeros(B, P_MAX, dtype=i32, device=dev), preq_slot=uv["pslot"],
+                         t2r=(torch.arange(R, device=dev) // 4).to(i32), qsl=torch.arange(0, R + 1, 4, dtype=i32, device=dev),
+                         valid=uv["valid"], lat=torch.empty(R, 512, dtype=torch.bfloat16, device=dev),
+                         seq_lens={1: uv["sl1"].view(B, 4), 2: uv["sl2"].view(B, 4)},
+                         cslot={1: uv["cs1"], 2: uv["cs2"]}, rslot=uv["rs"], up_d=up_d, up_dv=uv, up_h=None)
+            else:
+                d = dict(B=B, bt=torch.zeros(B, P_MAX, dtype=i32, device=dev), preq_slot=torch.zeros(B, dtype=i64, device=dev),
+                         t2r=(torch.arange(R, device=dev) // 4).to(i32), qsl=torch.arange(0, R + 1, 4, dtype=i32, device=dev),
+                         valid=torch.zeros(R, dtype=torch.bool, device=dev),
+                         lat=torch.empty(R, 512, dtype=torch.bfloat16, device=dev),
+                         seq_lens={c: torch.zeros(B, 4, dtype=i32, device=dev) for c in (1, 2)},
+                         cslot={c: torch.full((R,), -1, dtype=i64, device=dev) for c in (1, 2)},
+                         rslot=torch.full((R,), -1, dtype=i64, device=dev))
+            mir = self.mir[r] if getattr(self, "mir", None) and not s.get("lvl", 0) else None
+            if mir is not None:   # lever (a): the indexer reads the encoded table d["mbt"] (FlashMLA keeps d["bt"])
+                d["mir"] = mir
+                d["mbt"] = torch.zeros(B, P_MAX, dtype=i32, device=dev)
+                d["mcs"] = {c: torch.full((R,), -1, dtype=i64, device=dev) for c in (1, 2)}
+                ks = {L: X.CompactK(self.views[r][f"idx{L}"], d["mbt"], self.RPP[L], mir.kv[L]) for L in KV_SOURCES}
+            else:
+                ks = {L: X.CompactK(self.views[r][f"idx{L}"], d["bt"], self.RPP[L]) for L in KV_SOURCES}
+            oi = X.OwnedIndexer(ks, B, dev, mode=self.mode)
+            if self.logits_impl == "idx2f":
+                oi.dense_impl = "idx2f"
+            # graph bounds: the largest row the bucket admits (MAX_CTX; long-row levels: LEVEL_CTX[s["lvl"]], idx2f then
+            # takes the stock select / top-k statically on layers whose max_len passes its fast-mode limit)
+            bound = LEVEL_CTX[s.get("lvl", 0)]
+            d["bound"] = bound
+            for L in LAYERS:
+                oi.max_len[L] = bound // RATIO[L]
+            for L in KV_SOURCES:
+                oi.width[L] = -(-oi.max_len[L] // 256) * 256
+            if self.mode in ("fast", "hybrid"):
+                if s.get("lvl", 0):      # long-row levels: [R, max(ceil(fast max_len / CAND_BLOCK), 2048)]
+                    fast = max([m for m in oi.max_len.values() if m <= MAX_CTX] or [0])
+                    oi.bmax = torch.empty((R, max(-(-fast // X.CAND_BLOCK), 2048)), dtype=torch.float32, device=dev)
+                else:
+                    oi.bmax = torch.empty((R, -(-MAX_CTX // X.CAND_BLOCK)), dtype=torch.float32, device=dev)
+                oi.nb_lens = torch.zeros(R, dtype=i32, device=dev)
+            if IDX_FUSE and self.mode == "fast" and self.logits_impl == "idx2f" and hasattr(X, "GlobalOut") \
+                    and not s.get("lvl", 0):
+                oi.fuse = True
+            if IDX_SIDE:
+                d["side"] = torch.cuda.Stream(device=dev)
+                d["wbuf"] = torch.empty((R, 32), dtype=torch.bfloat16, device=dev)
+            if s.get("lvl", 0) and hasattr(oi, "logits_scratch"):   # one shared fp32 scratch per device for the long variants
+                oi.logits_scratch = self._long_scratch(dev, R, bound)
+            d["oi"] = oi
+            d["global_rows"] = 0
+            E = sys.modules.get("engine.engine")
+            if E is not None and E.POISON:   # debug: the decode bucket's persistent indexer state (never rewritten wholesale)
+                E.poison_(d["lat"], oi.cand, oi.compact, oi.bmax, *list(oi.topk.values()))
+        s["idx"] = d
+
+    def _long_scratch(self, dev, R: int, bound: int):
+        """fp32 logits scratch per device shared by the long-row variants (they run one at a time on the device's stream).
+        (c1-tail 19 Nov) Sized to the largest R x bound CREATED so far, not max decode bucket x LEVEL_CTX[-1] up front (604 MiB
+        at ~240 rows while fix A's precapture creates only R 4 x 524,288 = 8 MiB). A later, larger long variant (a late create)
+        gets a FRESH buffer; every earlier buffer stays referenced in self._lscr[dev] for the process lifetime (never resized,
+        freed or reused for a larger size in place), so no captured graph keeps a pointer into freed memory. Variants that fit
+        the newest buffer share it, exactly as before. Each variant gets a contiguous [R, bound] view at offset 0 of its buffer
+        either way: no kernel reads the buffer's size (idx2f _scratch takes flat[:rows * w], rows * w <= R * bound), so the
+        logits / selects are bitwise identical to the old sizing. ENG_IDX_LONG_SCRATCH_FULL=1: the old up-front size."""
+        need = R * bound
+        lst = self.__dict__.setdefault("_lscr", {}).setdefault(str(dev), [])
+        if not lst or lst[-1].numel() < need:
+            full = max(self.eng.cfg.buckets) * LEVEL_CTX[-1]
+            n = max(full, need) if LONG_SCRATCH_FULL else need
+            was = lst[-1].numel() * 4 / 2 ** 20 if lst else 0.0
+            lst.append(torch.empty(n, dtype=torch.float32, device=dev))
+            try:   # LATE (FPR): after ENG_PRECAP_DEFER's job ran (or gave up) and no warm-up hold remains = at serve time
+                e_ = self.eng
+                late = bool(e_.stats.get("precap_done_s") is not None or e_.stats.get("precap_defer_gave_up")) \
+                    and not e_.warmup_due()
+            except Exception:  # noqa: BLE001  (no engine stats: never LATE)
+                late = False
+            print(f"hooks_idx: long scratch{' LATE' if late else ''} {dev}: R {R} x bound {bound:,} = {n * 4 / 2 ** 20:.1f} MiB (was {was:.1f} MiB; "
+                  f"buffers {len(lst)}, total {sum(x.numel() for x in lst) * 4 / 2 ** 20:.1f} MiB; up-front rule "
+                  f"{full * 4 / 2 ** 20:.1f} MiB{', FULL' if LONG_SCRATCH_FULL else ''})", flush=True)
+        cur = lst[-1]
+        assert need <= cur.numel()
+        return cur[:need].view(R, bound)
+
+    # ---- host side of a step
+    def _set_logits(self) -> None:
+        """IDX_F8: idx2f's logits kernel family for this step's calls (ext_logits() reads idx2f.LOGITS per call; graphs keep
+        the family they were captured with, and tests recapture per arm)."""
+        if self._logits0 is not None:
+            want = "f8" if IDX_F8 else self._logits0
+            if self.X.LOGITS != want:
+                self.X.LOGITS = want
+
+    def upload(self, r: int, s: dict, sb, tab=None) -> None:
+        """Decode bucket tables, vectorized (numpy, O(rows)); block tables from the per-slot device table (D12 deltas)."""
+        self._set_logits()
+        if self.eng.cfg.upload_v2:
+            return self._upload_v2(r, s, sb, tab)
+        import numpy as np
+        d = s["idx"]
+        R, B = s["R"], d["B"]
+        n = sb.n_rows
+        S = len(sb.seqs)
+        assert n == 4 * S and all(se.kind == "decode" and se.n_rows == 4 and se.row0 == 4 * b for b, se in enumerate(sb.seqs)), \
+            "idx2f hook: decode rows only (4 per sequence, sequence-contiguous)"
+        d["dev_bt"] = tab is not None and self.apply_deltas(r, tab)
+        cap = d.get("dev_bt_captured")
+        if cap is not None and cap != d["dev_bt"]:
+            # run()'s block-table branch is fixed in the bucket's captured graph: a replay with the other table mode would
+            # read a stale block table. Never silently.
+            raise RuntimeError(f"idx2f hook rank {r}: decode graph captured with dev_bt={cap}, step has dev_bt={d['dev_bt']}")
+        i64 = np.int64
+        pos = np.asarray(sb.positions, dtype=i64)
+        if n:
+            assert int(pos.max()) + 1 <= d.get("bound", MAX_CTX), \
+                f"context {int(pos.max()) + 1} > {d.get('bound', MAX_CTX)} (the decode bucket's indexer bound)"
+        ps = np.asarray(sb.paged_slot, dtype=i64)
+        sslot = np.asarray([se.state_slot for se in sb.seqs], dtype=i64)
+        sl1 = np.zeros((B, 4), np.int32)
+        sl2 = np.zeros((B, 4), np.int32)
+        sl1.reshape(-1)[:n] = pos + 1
+        sl2.reshape(-1)[:n] = (pos + 1) // 2
+        cs1 = np.full(R, -1, i64)
+        cs2 = np.full(R, -1, i64)
+        okp = ps >= 0
+        pg, off = ps // 64, ps % 64
+        cs1[:n] = np.where(okp, pg * 64 + off, -1)
+        cs2[:n] = np.where(okp, pg * 32 + off // 2, -1)
+        rs = np.full(R, -1, i64)
+        rs[:n] = np.repeat(sslot, 4) * 8 + pos % 8
+        valid = np.zeros(R, bool)
+        valid[:n] = True
+        pslot = np.full(B, self.views[r]["dbt"].shape[0] - 1, i64)
+        pslot[:S] = sslot
+        if d.get("mir") is not None:   # lever (a): reclamation recency
+            d["mir"].touch(sslot)
+        ups = [(sl1, d["seq_lens"][1]), (sl2, d["seq_lens"][2]), (cs1, d["cslot"][1]), (cs2, d["cslot"][2]), (rs, d["rslot"]),
+               (valid, d["valid"]), (pslot, d["preq_slot"])]
+        if not d["dev_bt"]:                      # tests without deltas: the full table on the host
+            bt = np.zeros((B, P_MAX), np.int32)
+            for b, se in enumerate(sb.seqs):
+                nb = se.n_blocks if hasattr(se, "n_blocks") else len(se.block_table)   # never the live length (serve)
+                bt[b, :nb] = se.block_table[:nb]
+            ups.append((bt, d["bt"]))
+        for h, t in ups:
+            t.copy_(torch.from_numpy(h).pin_memory(), non_blocking=True)
+        d["global_rows"] = sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else n
+        d["max_seq_len"] = d.get("bound", MAX_CTX)
+        if LONG_ANY_ROWS and d["max_seq_len"] > MAX_CTX:   # Clariden: long variants always on the persistent top-k
+            d["global_rows"] = max(d["global_rows"], 65)
+
+    def _upload_v2(self, r: int, s: dict, sb, tab=None) -> None:
+        """upload() with the same device result: every per-step array (and the block-table deltas, up to NU_MAX entries)
+        filled into one pinned host blob of the bucket (two sets, a set refilled only after its copy from two steps ago
+        completed) -> ONE H2D copy into the bucket's blob (the indexer's input tensors are its views)."""
+        import numpy as np
+        d = s["idx"]
+        R, B = s["R"], d["B"]
+        n = sb.n_rows
+        S = len(sb.seqs)
+        assert n == 4 * S and all(se.kind == "decode" and se.n_rows == 4 and se.row0 == 4 * b for b, se in enumerate(sb.seqs)), \
+            "idx2f hook: decode rows only (4 per sequence, sequence-contiguous)"
+        if d["up_h"] is None:
+            nbytes = d["up_d"].numel()
+            d["up_h"] = [[torch.zeros(nbytes, dtype=torch.uint8, pin_memory=True), None] for _ in range(2)]
+            d["up_hv"] = [_up_views(x[0], R, B, numpy=True) for x in d["up_h"]]
+            d["up_i"] = 0
+        i = d["up_i"]
+        hb, ev = d["up_h"][i]
+        if ev is not None:
+            ev.synchronize()
+        v = d["up_hv"][i]
+        # block-table deltas (apply_deltas, same entries in the same order)
+        sq = (getattr(tab, "seq", None) or {}) if tab is not None else {}
+        nu, big = 0, None
+        if tab is None or "bt_upd_seq" not in sq:
+            dev_bt = False
+        elif not tab.n:
+            dev_bt = IDLE_DEV_BT
+        else:
+            dev_bt = True
+            ks, s0, ln = sq["bt_upd_seq"].tolist(), sq["bt_upd_start"].tolist(), sq["bt_upd_len"].tolist()
+            nu = int(sum(ln)) if ks else 0
+            if nu:
+                slots = sq["state_slot"]
+                rows = np.repeat(np.asarray([int(slots[k]) for k in ks], np.int64), ln)
+                cols = np.concatenate([np.arange(a_, a_ + n_, dtype=np.int64) for a_, n_ in zip(s0, ln)])
+                pages = sq["bt_upd_pages"].numpy().astype(np.int32, copy=False)
+                if nu <= NU_MAX:
+                    v["du_rows"][:nu], v["du_cols"][:nu], v["du_pages"][:nu] = rows, cols, pages
+                else:                            # (rare: more new pages than the blob holds) per tensor, as v1
+                    big = (rows, cols, pages)
+                    nu = 0
+        d["dev_bt"] = dev_bt
+        if dev_bt and tab is not None and tab.n:
+            self._mirror_seq_deltas(r, tab)  # lever (a): the blob's deltas (not apply_deltas) into the mirror map
+        cap = d.get("dev_bt_captured")
+        if cap is not None and cap != d["dev_bt"]:
+            raise RuntimeError(f"idx2f hook rank {r}: decode graph captured with dev_bt={cap}, step has dev_bt={d['dev_bt']}")
+        i64 = np.int64
+        pos = np.asarray(sb.positions, dtype=i64)
+        if n:
+            assert int(pos.max()) + 1 <= d.get("bound", MAX_CTX), \
+                f"context {int(pos.max()) + 1} > {d.get('bound', MAX_CTX)} (the decode bucket's indexer bound)"
+        ps = np.asarray(sb.paged_slot, dtype=i64)
+        sslot = np.asarray([se.state_slot for se in sb.seqs], dtype=i64)
+        sl1, sl2 = v["sl1"], v["sl2"]
+        sl1[:] = 0
+        sl2[:] = 0
+        sl1[:n] = pos + 1
+        sl2[:n] = (pos + 1) // 2
+        cs1, cs2, rs = v["cs1"], v["cs2"], v["rs"]
+        cs1[:] = -1
+        cs2[:] = -1
+        okp = ps >= 0
+        pg, off = ps // 64, ps % 64
+        cs1[:n] = np.where(okp, pg * 64 + off, -1)
+        cs2[:n] = np.where(okp, pg * 32 + off // 2, -1)
+        rs[:] = -1
+        rs[:n] = np.repeat(sslot, 4) * 8 + pos % 8
+        if d.get("mir") is not None:   # lever (a): reclamation recency
+            d["mir"].touch(sslot)
+        v["valid"][:] = False
+        v["valid"][:n] = True
+        v["pslot"][:] = self.views[r]["dbt"].shape[0] - 1
+        v["pslot"][:S] = sslot
+        d["up_d"].copy_(hb, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(s["dev"]))
+        d["up_h"][i][1] = ev
+        d["up_i"] = i ^ 1
+        dbt = self.views[r]["dbt"]
+        if nu:
+            uv = d["up_dv"]
+            dbt.index_put_((uv["du_rows"][:nu], uv["du_cols"][:nu]), uv["du_pages"][:nu])
+        elif big is not None:
+            dev = dbt.device
+            dbt.index_put_((torch.from_numpy(big[0]).to(dev), torch.from_numpy(big[1]).to(dev)),
+                           torch.from_numpy(big[2]).to(dev))
+        if not d["dev_bt"]:                      # tests without deltas: the full table on the host
+            bt = np.zeros((B, P_MAX), np.int32)
+            for b, se in enumerate(sb.seqs):
+                nb = se.n_blocks if hasattr(se, "n_blocks") else len(se.block_table)   # never the live length (serve)
+                bt[b, :nb] = se.block_table[:nb]
+            d["bt"].copy_(torch.from_numpy(bt).pin_memory(), non_blocking=True)
+        d["global_rows"] = sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else n
+        d["max_seq_len"] = d.get("bound", MAX_CTX)
+        if LONG_ANY_ROWS and d["max_seq_len"] > MAX_CTX:   # Clariden: long variants always on the persistent top-k
+            d["global_rows"] = max(d["global_rows"], 65)
+
+    def upload_d13(self, r: int, s: dict, sb) -> None:
+        """D13 async decode: the host-known part of upload() (sequence slots, valid rows, the per-row state-slot base of
+        rslot) into the bucket's blob; positions / paged slots come from rowexp (device_tables_d13 after its expand).
+        Block tables: always the per-slot device table (D13 applies the step's deltas itself)."""
+        self._set_logits()
+        import numpy as np
+        d = s["idx"]
+        R, B = s["R"], d["B"]
+        n = sb.n_rows
+        S = len(sb.seqs)
+        assert n == 4 * S, "idx2f hook (D13): decode rows only (4 per sequence, sequence-contiguous)"
+        assert "up_d" in d, "D13 needs upload_v2 buckets (EngineConfig.upload_v2)"
+        if d["up_h"] is None:
+            nbytes = d["up_d"].numel()
+            d["up_h"] = [[torch.zeros(nbytes, dtype=torch.uint8, pin_memory=True), None] for _ in range(2)]
+            d["up_hv"] = [_up_views(x[0], R, B, numpy=True) for x in d["up_h"]]
+            d["up_i"] = 0
+        d["dev_bt"] = True
+        cap = d.get("dev_bt_captured")
+        if cap is not None and cap != d["dev_bt"]:
+            raise RuntimeError(f"idx2f hook rank {r}: decode graph captured with dev_bt={cap}, step has dev_bt=True")
+        i = d["up_i"]
+        hb, ev = d["up_h"][i]
+        if ev is not None:
+            ev.synchronize()
+        v = d["up_hv"][i]
+        sslot = np.asarray([se.state_slot for se in sb.seqs], dtype=np.int64)
+        if d.get("mir") is not None:   # lever (a): reclamation recency
+            d["mir"].touch(sslot)
+        v["valid"][:] = False
+        v["valid"][:n] = True
+        v["pslot"][:] = self.views[r]["dbt"].shape[0] - 1
+        v["pslot"][:S] = sslot
+        v["rs"][:] = -1
+        v["rs"][:n] = np.repeat(sslot, 4) * 8         # + pos % 8 on the device
+        d["up_d"].copy_(hb, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(s["dev"]))
+        d["up_h"][i][1] = ev
+        d["up_i"] = i ^ 1
+        d["global_rows"] = sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else n
+        d["max_seq_len"] = d.get("bound", MAX_CTX)
+        if LONG_ANY_ROWS and d["max_seq_len"] > MAX_CTX:   # Clariden: long variants always on the persistent top-k
+            d["global_rows"] = max(d["global_rows"], 65)
+
+    def upload_d13_host(self, r: int, s: dict, sb) -> None:
+        """ENG_D13_EMPTY (d13.py): the host-side state upload_d13 sets, for a rank whose device inputs are left as the
+        previous empty step wrote them (no sequences: the blob would be the same)."""
+        self._set_logits()
+        d = s["idx"]
+        d["dev_bt"] = True
+        d["global_rows"] = sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else sb.n_rows
+        d["max_seq_len"] = d.get("bound", MAX_CTX)
+        if LONG_ANY_ROWS and d["max_seq_len"] > MAX_CTX:
+            d["global_rows"] = max(d["global_rows"], 65)
+
+    def device_tables_d13(self, r: int, s: dict, paged: torch.Tensor) -> None:
+        """D13: upload()'s position-derived tables on the device from rowexp's pos / paged slots (same values as the
+        host formulas: seq_lens = pos + 1 / (pos + 1) // 2, compressed slots of the paged slot, rslot = slot * 8 + pos % 8;
+        padding rows 0 / -1). On the current (step) stream, after rowexp's expand."""
+        d = s["idx"]
+        R = s["R"]
+        pos, v = s["pos"][:R], d["valid"]
+        p1 = pos + 1
+        d["seq_lens"][1].view(-1).copy_(torch.where(v, p1, 0))
+        d["seq_lens"][2].view(-1).copy_(torch.where(v, p1 // 2, 0))
+        ok = v & (paged >= 0)
+        d["cslot"][1].copy_(torch.where(ok, paged, -1))
+        d["cslot"][2].copy_(torch.where(ok, (paged // 64) * 32 + (paged % 64) // 2, -1))
+        d["rslot"].copy_(torch.where(v, d["rslot"] + pos % 8, -1))
+
+    # ---- mixed steps (eager): any row layout (decode rows + prefill chunks + padding)
+    @staticmethod
+    def layout(sb):
+        """Indexer rows: pseudo-requests of 4 consecutive rows of ONE sequence (DeepGEMM next_n = 4 shares a block table;
+        rows of a pseudo-request past the sequence's rows are padding). Decode sequences: their own 4 rows."""
+        ir2row, preq_seq = [], []
+        for si, se in enumerate(sb.seqs):
+            for c0 in range(0, se.n_rows, 4):
+                preq_seq.append(si)
+                ir2row += [se.row0 + c0 + j if c0 + j < se.n_rows else -1 for j in range(4)]
+        return ir2row, preq_seq
+
+    def upload_general(self, r: int, s: dict, sb, tab=None) -> None:
+        """Tables of an eager mixed step: ENG_IDX_TABLES selects the device tables (tables2f.GeneralTables), the host
+        path (_upload_general_host), or both compared."""
+        self._set_logits()
+        if self.tables == "host" or tab is None:
+            return self._upload_general_host(r, s, sb, tab)
+        gt, core = self._general_tables(r, s)
+        bt0 = core.bt if core is not None else None
+        grows = sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else sb.n_rows
+        d = gt.upload(tab, grows, None)     # eager: rows > 262,144 positions take idx2f's stock fallback
+        if core is not None and core.bt is not bt0:   # the shared set grew (B > its Bc): the family's stale tables go
+            self._onebk_sweep(r, core, s)
+        if d is None:                       # tables without D12 deltas or rows out of sequence order: host path
+            self.checked["fallback"] += 1
+            return self._upload_general_host(r, s, sb, tab)
+        self._mirror_seq_deltas(r, tab)     # lever (a): GeneralTables applied the deltas to dbt; the mirror map follows
+        if self.tables == "device":
+            s["idx"] = d
+            return
+        self._upload_general_host(r, s, sb, tab)
+        self._compare(s["idx"], d, sb.n_rows)
+
+    def _new_gt(self, r: int, s: dict):
+        import tables2f as T2
+        v = self.views[r]
+        return T2.GeneralTables(s["dev"], s["R"], s["pos"], v["dbt"], {L: v[f"idx{L}"] for L in KV_SOURCES}, self.RPP,
+                                self.mode, "idx2f" if self.logits_impl == "idx2f" else "deepgemm")
+
+    def _onebk_base(self, r: int, s: dict):
+        """ENG_MIX_ONE_BUCKET (with ENG_IDX_ONEBK_SHARE): rank r's pinned base state of the view family s belongs to (the
+        view's base, A or T: s a cached view in eng.bk_view, or the base itself), else None (plain buckets, the flag off).
+        Role-agnostic on purpose: A and T families have different bases, hence different shared sets."""
+        bv = getattr(self.eng, "bk_view", None) if ONEBK_SHARE else None
+        if not bv:
+            return None
+        for base, st in bv.values():
+            if st[r] is s or base[r] is s:
+                return base[r]
+        return None
+
+    def _general_tables(self, r: int, s: dict):
+        """(the state's GeneralTables, the onebk core or None). Plain states: their own, created at first use (as before).
+        onebk family: the base's own GeneralTables is the core (sized for the base's R, grown by tables2f as for any
+        bucket); each view gets a GtView over it, rebuilt when the core's buffers were replaced (growth) or the base
+        re-carved."""
+        base = self._onebk_base(r, s)
+        gt = s.get("idx_gt")
+        if base is None:
+            if gt is None:
+                gt = s["idx_gt"] = self._new_gt(r, s)
+            return gt, None
+        core = base.get("idx_gt")
+        if core is None:
+            core = base["idx_gt"] = self._new_gt(r, base)
+        if base is s:
+            return core, core
+        if gt is None or getattr(gt, "_core", None) is not core or gt._core_bt is not core.bt:
+            gt = s["idx_gt"] = _gt_view(core, s)
+            if not getattr(self, "_onebk_logged", False):
+                self._onebk_logged = True
+                getattr(self.eng, "log", print)(f"hooks_idx: ENG_IDX_ONEBK_SHARE: onebk views share their base bucket's "
+                                                f"GeneralTables (base A or T; first: core R={core.R}, Bc={core.Bc}, view "
+                                                f"R={s['R']})")
+        return gt, core
+
+    def _onebk_sweep(self, r: int, core, keep: dict) -> None:
+        """After the shared set grew: the other members' tables (and their last finished step's indexer state) still
+        reference the old buffers; drop them so the old storage is freed now (they are rebuilt at their next step)."""
+        for base, st in self.eng.bk_view.values():
+            for v in (st[r], base[r]):
+                if v is keep:
+                    continue
+                if v is base[r]:
+                    if v.get("idx_gt") is core:
+                        v.pop("idx", None)
+                elif getattr(v.get("idx_gt"), "_core", None) is core:
+                    v.pop("idx_gt", None)
+                    v.pop("idx", None)
+
+    def _compare(self, h: dict, d: dict, n: int) -> None:
+        """ENG_IDX_TABLES=check: the device tables == the host tables on every key the hook reads."""
+        bad = []
+        self.checked["steps"] += 1
+        if h.get("idle") or d.get("idle"):
+            if bool(h.get("idle")) != bool(d.get("idle")):
+                bad.append("idle")
+        else:
+            for k in ("B", "IR", "global_rows", "max_seq_len"):
+                if int(h[k]) != int(d[k]):
+                    bad.append(f"{k} {h[k]} != {d[k]}")
+            IR, B = h["IR"], h["B"]
+            pairs = [("t2r_ir", IR), ("valid_ir", IR), ("ir2row_c", IR), ("vir", n), ("vrow", n), ("rslot", None),
+                     ("qsl", None), ("t2r", n)]
+            for k, m in pairs:
+                a_, b_ = h[k], d[k]
+                if m is not None:
+                    a_, b_ = a_[:m], b_[:m]
+                if a_.shape != b_.shape or not bool((a_.to(b_.dtype) == b_).all()):
+                    bad.append(k)
+            for c in (1, 2):
+                if not bool((h["seq_lens"][c] == d["seq_lens"][c]).all()):
+                    bad.append(f"seq_lens{c}")
+                if not bool((h["cslot"][c] == d["cslot"][c]).all()):      # all R rows: padding rows must be -1
+                    bad.append(f"cslot{c}")
+            P = min(h["bt"].shape[1], d["bt"].shape[1])
+            if not bool((h["bt"][:B, :P] == d["bt"][:B, :P]).all()):
+                bad.append("bt")
+            rh = {int(k): int(v) for k, v in h["row2ir"].items()}
+            rd = {i: int(x) for i, x in enumerate(d["row2ir"][:n])}
+            if rh != rd:
+                bad.append("row2ir")
+            oh, od = h["oi"], d["oi"]
+            for L in (2, 8, 14, 20, 24, 28, 32, 36):
+                if oh.max_len.get(L) != od.max_len.get(L):
+                    bad.append(f"max_len{L} {oh.max_len.get(L)} != {od.max_len.get(L)}")
+            for L in (2, 8, 14, 20):
+                if oh.width.get(L) != od.width.get(L):
+                    bad.append(f"width{L}")
+        if bad:
+            self.checked["mismatch"] += 1
+            print(f"ENG_IDX_TABLES check: device != host tables: {bad[:8]}", flush=True)
+
+    def _upload_general_host(self, r: int, s: dict, sb, tab=None) -> None:
+        """Host tables of an eager mixed step (bucket rows = sb's rows, padded to s['R']); a fresh OwnedIndexer sized for
+        this step's pseudo-requests, planned on the host bounds (OwnedIndexer.plan)."""
+        X, dev, R = self.X, s["dev"], s["R"]
+        if POP_IDX_FIRST:
+            s.pop("idx", None)          # the previous step's indexer state (finished: steps end synchronized)
+        ir2row, preq_seq = self.layout(sb)
+        if not ir2row:
+            ir2row, preq_seq = [-1] * 4, [0]
+        IR, B = len(ir2row), len(preq_seq)
+        i32, i64 = torch.int32, torch.int64
+        seqs = sb.seqs
+        nbs = [se.n_blocks if hasattr(se, "n_blocks") else len(se.block_table) for se in seqs]
+        dev_bt = tab is not None and self.apply_deltas(r, tab)
+        if dev_bt:
+            pq = torch.tensor([seqs[si].state_slot for si in preq_seq] if seqs else [0], dtype=i64).to(dev, non_blocking=True)
+            bt = None
+        else:
+            P = max(nbs + [1])
+            P = -(-P // 64) * 64
+            bt = torch.zeros(B, P, dtype=i32)
+            for b, si in enumerate(preq_seq):
+                if seqs:
+                    tb = seqs[si].block_table[: nbs[si]]
+                    bt[b, : len(tb)] = torch.tensor(tb, dtype=i32)
+        pos = torch.tensor(sb.positions + [0] * (R - sb.n_rows), dtype=i64)
+        irr = torch.tensor(ir2row, dtype=i64)
+        ok = irr >= 0
+        pir = torch.where(ok, pos[irr.clamp(min=0)], torch.zeros_like(irr))
+        sl = {2: torch.where(ok, (pir + 1) // 2, 0).to(i32).view(B, 4), 1: torch.where(ok, pir + 1, 0).to(i32).view(B, 4)}
+        # padding rows inside a group carry the group's last real row's length (DeepGEMM next_n = 4 scans the
+        # pages of the group's last row; a 0 there makes the whole group scan nothing); they stay invalid (valid_ir)
+        okv = ok.view(B, 4)
+        for c in (1, 2):
+            v = sl[c]
+            last = torch.where(okv, v, torch.zeros_like(v)).max(1, keepdim=True).values
+            sl[c] = torch.where(okv, v, last).contiguous()
+        # no MAX_CTX limit here: in eager steps idx2f's plan routes layers with rows > 262,144 compressed positions to
+        # the stock select / top-k; only the decode graphs keep MAX_CTX
+        cs = {c: torch.full((R,), -1, dtype=i64) for c in (1, 2)}
+        rs = torch.full((R,), -1, dtype=i64)
+        qsl = torch.zeros(max(len(seqs), 1) + 1, dtype=i32)
+        t2r = torch.full((R,), max(len(seqs) - 1, 0), dtype=i32)
+        for si, se in enumerate(seqs):
+            qsl[si + 1] = se.row0 + se.n_rows
+            for j in range(se.n_rows):
+                row, p = se.row0 + j, se.start + j
+                t2r[row] = si
+                ps = sb.paged_slot[row]
+                if ps >= 0:
+                    pg, off = ps // 64, ps % 64
+                    cs[2][row], cs[1][row] = pg * 32 + off // 2, pg * 64 + off
+                rs[row] = se.state_slot * 8 + p % 8
+        vir = ok.nonzero().flatten()
+        to = lambda x: x.pin_memory().to(dev, non_blocking=True)  # noqa: E731
+        d = dict(general=True, B=B, IR=IR, bt=(self.views[r]["dbt"].index_select(0, pq) if dev_bt else to(bt)), t2r_ir=to(torch.arange(IR, dtype=i32) // 4), valid_ir=to(ok),
+                 ir2row_c=to(irr.clamp(min=0)), vir=to(vir), vrow=to(irr[vir]), seq_lens={c: to(sl[c]) for c in (1, 2)},
+                 cslot={c: to(cs[c]) for c in (1, 2)}, rslot=to(rs), qsl=to(qsl), t2r=to(t2r),
+                 lat=torch.empty(R, 512, dtype=torch.bfloat16, device=dev), row2ir={int(x): i for i, x in enumerate(ir2row) if x >= 0},
+                 ir2row_h=list(ir2row),
+                 global_rows=sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else sb.n_rows,
+                 max_seq_len=max(int(pir.max()) + 1, 1))
+        if not sb.n_rows or not int(ok.sum()):
+            d["idle"] = True            # an idle rank (no rows this step): the hook does nothing on it
+            s["idx"] = d
+            return
+        ks = {L: X.CompactK(self.views[r][f"idx{L}"], d["bt"], self.RPP[L]) for L in KV_SOURCES}
+        lean = self.lean and hasattr(X, "EagerWorkspace")
+        if lean:   # idx2f's lean eager indexer: every per-call buffer is a view of one fixed ~406 MB workspace per device
+            oi = X.OwnedIndexer(ks, B, dev, mode=self.mode, lean=True, ws=X.EagerWorkspace.of(dev))
+        else:
+            oi = X.OwnedIndexer(ks, B, dev, mode=self.mode)
+        if self.logits_impl == "idx2f":
+            oi.dense_impl = "idx2f"
+        ins = {L: X.LayerIn(None, None, d["seq_lens"][RATIO[L]], d["max_seq_len"], d["global_rows"]) for L in LAYERS}
+        if lean:
+            oi.plan_bounds(ins, d["max_seq_len"])
+        elif hasattr(oi, "plan_bounds") and USE_PLAN_BOUNDS:
+            # host bounds (no device reads; = plan(): max_len[L] = (max position + 1) // ratio) and a PERSISTENT block-max
+            # buffer per bucket: plan() allocated a fresh [IR, context / 8] fp32 one every step, whose size grows with
+            # every chunk of a long prompt, so the caching allocator never reused it (memory growth on long prompts)
+            nbw = max(-(-min(d["max_seq_len"], X.LONG_ROW) // X.CAND_BLOCK), X.CAND_K)
+            buf = s.get("idx_bmax")
+            if buf is None or buf.numel() < IR * nbw:
+                s["idx_bmax"] = buf = None
+                cap = max(IR, s["R"] + 512) * max(nbw, -(-X.LONG_ROW // X.CAND_BLOCK))
+                buf = s["idx_bmax"] = torch.empty(cap, dtype=torch.float32, device=dev)
+            oi.plan_bounds(ins, d["max_seq_len"], None, buf)
+        else:
+            oi.plan(ins)
+        if not lean and self.mode in ("fast", "hybrid") and oi.bmax.shape[1] < X.CAND_K:   # consumers: 16,384 positions
+            oi.bmax = torch.empty((IR, X.CAND_K), dtype=torch.float32, device=dev)
+        d["oi"] = oi
+        s["idx"] = d
+        E = sys.modules.get("engine.engine")
+        if E is not None and E.POISON:      # debug: the fresh per-step indexer state, poisoned (see engine.poison_), on
+            E.poison_(d["lat"], oi.cand, oi.compact, getattr(oi, "bmax", None), *list(oi.topk.values()))   # the current
+            # stream: upload_general runs inside the rank's engine-stream context (prepare / step_mixed)
+
+    def carry_candidates(self, sA: dict, sT: dict, tail_rows: list, ix=None) -> None:
+        """Layer 20's candidate blocks of the tail rows (computed on all rows) -> the tail bucket's indexer (24..36).
+        ix = the tail rows as a device int64 tensor (device tables: device-side maps, no host lists)."""
+        dA, dT = sA["idx"], sT["idx"]
+        if dA.get("idle") or dT.get("idle") or not tail_rows:
+            return
+        if CARRY_ASC:     # the carried lists keep layer 20's order (stock select = score order): T's consumers must know it
+            dT["oi"].cand_ascending = bool(getattr(dA["oi"], "cand_ascending", True))
+        if ix is not None and "row2ir_dev" in dA and "row2ir_dev" in dT:     # ENG_IDX_TABLES=device
+            IR = int(dT["IR"])
+            dev = sA["dev"]
+            if CAND_PAD_FIX:
+                # every T indexer row, padding rows of a 4-row group included: they take the group's last real row (the
+                # real rows of a group come first; GeneralTables keeps cand across steps, so padding rows held stale ids)
+                ar = torch.arange(IR, device=dev)
+                last = torch.where(dT["valid_ir"][:IR], ar, torch.full_like(ar, -1)).view(-1, 4).cummax(1).values.view(-1)
+                trow = dT["ir2row_c"][:IR].index_select(0, last.clamp(min=0))          # IR row -> its T row
+                src = dA["row2ir_dev"].index_select(0, ix.index_select(0, trow))
+                dT["oi"].cand.index_copy_(0, ar, dA["oi"].cand.index_select(0, src))
+            else:
+                m = len(tail_rows)
+                dT["oi"].cand.index_copy_(0, dT["row2ir_dev"][:m],
+                                          dA["oi"].cand.index_select(0, dA["row2ir_dev"].index_select(0, ix)))
+            return
+        src = [dA["row2ir"][row] for row in tail_rows]
+        dst = [dT["row2ir"][t] for t in range(len(tail_rows))]
+        irT = dT.get("ir2row_h")
+        if CAND_PAD_FIX and irT is not None:
+            # the tail bucket's indexer is fresh each step (torch.empty cand): padding rows of a 4-row group (a sequence's
+            # tail rows % 4 != 0) take part in the group's candidate union (they carry the group's last real length), so
+            # they get the group's last real row's candidates instead of uninitialized block ids
+            src, dst = [], []
+            for g in range(0, len(irT), 4):
+                grp = irT[g:g + 4]
+                real = [t for t in grp if t >= 0]
+                if not real:
+                    continue
+                for j, t in enumerate(grp):
+                    dst.append(g + j)
+                    src.append(dA["row2ir"][tail_rows[t if t >= 0 else real[-1]]])
+        dev = sA["dev"]
+        dT["oi"].cand.index_copy_(0, torch.tensor(dst, device=dev), dA["oi"].cand.index_select(0, torch.tensor(src, device=dev)))
+
+    def _run_general(self, r: int, s: dict, L: int) -> None:
+        """Mixed steps: the compressor half then the scoring half (CP prefill exchanges index pages between them)."""
+        self._compress_general(r, s, L)
+        self._score_general(r, s, L)
+
+    def _compress_general(self, r: int, s: dict, L: int) -> None:
+        """KV-source layers: the compressed / index records of this step's rows (kv_score GEMM, pooling, inserts)."""
+        from vllm.models.deepseek_v41.common.ops import indexer_k_norm_rope_store
+        from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import fused_save_compress_norm, rope_quant_insert
+
+        W, d, v = self.W[r][L], s["idx"], self.views[r]
+        ratio = RATIO[L]
+        x, pos = s["a"], s["pos"]
+        if d.get("idle") or L not in KV_SOURCES:
+            return
+        if True:
+            ks = self.dbg.get(("ks", L))
+            if ks is None:
+                ks = torch.mm(x, W["comp_w"].T, out_dtype=torch.float32)
+            cslot = d["cslot"][ratio]
+            if ratio == 2:
+                fused_save_compress_norm(ks, pos, v[f"ring{L}"], d["rslot"], d["qsl"], d["t2r"], W["comp_norm"], EPS, ratio,
+                                         d["lat"])
+            else:
+                fused_save_compress_norm(ks, pos, None, cslot, None, None, W["comp_norm"], EPS, ratio, d["lat"])
+            rope_quant_insert(d["lat"], pos, W["cos_sin"], v[f"comp{L}"], cslot, ratio)
+            kpre = F.linear(d["lat"], W["idx_wk"])
+            indexer_k_norm_rope_store(kpre, pos, W["cos_sin"], W["idx_k_norm"], EPS, v[f"idxs{L}"], cslot, ratio, False)
+
+    def _score_general(self, r: int, s: dict, L: int) -> None:
+        """Index layers: scoring over the context's index keys -> the rows' top-512 (ti / tl)."""
+        from vllm.models.deepseek_v41.common.ops import fused_indexer_q_rope_quant
+        from vllm.models.deepseek_v41.common.ops.cache_utils import compute_global_topk_indices_and_lens
+
+        X, W, d = self.X, self.W[r][L], s["idx"]
+        R, ratio = s["R"], RATIO[L]
+        x, qr, pos = s["a"], s["ws"]["qr"], s["pos"]
+        if d.get("idle"):        # no rows on this rank this step: nothing to compress or score; FlashMLA reads no keys
+            s["ti"][L].fill_(-1)
+            s["tl"][L].zero_()
+            return
+        oi = d["oi"]
+        if oi.max_len.get(L, 1) <= 0:
+            # no compressed position yet on any row (e.g. a 1-token prompt at ratio 2: (0 + 1) // 2 = 0): the top-512 is
+            # empty (production: zero-length rows); idx2f has no zero-width logits call
+            s["ti"][L].fill_(-1)
+            s["tl"][L].zero_()
+            return
+        w = F.linear(x, W["idx_wp"])
+        q = F.linear(qr, W["idx_wq_b"])
+        q8, wo = fused_indexer_q_rope_quant(pos, q.view(R, 32, 128), W["cos_sin"], w, 128 ** -0.5, 32 ** -0.5)
+        q8i = q8.index_select(0, d["ir2row_c"]).view(d["B"], 4, 32, 128)
+        woi = wo.index_select(0, d["ir2row_c"]).contiguous()
+        top = oi.layer(L, X.LayerIn(q8i, woi, d["seq_lens"][ratio], d["max_seq_len"], d["global_rows"]))
+        oi.logits.pop(L, None)       # eager: free the [IR, width] fp32 logits before the next layer
+        g, ln = compute_global_topk_indices_and_lens(top, d["t2r_ir"], d["bt"], self.RPP[K_SOURCE[L]], d["valid_ir"])
+        s["ti"][L].fill_(-1)     # rows of this bucket that are not this step's indexer rows: no keys (no stale lists)
+        s["tl"][L].zero_()
+        s["ti"][L].view(R, 512).index_copy_(0, d["vrow"], g.index_select(0, d["vir"]))
+        s["tl"][L].index_copy_(0, d["vrow"], ln.index_select(0, d["vir"]))
+
+    # ---- device side, inside the layer (graph-capturable)
+    def run(self, r: int, s: dict, L: int) -> None:
+        if s["idx"].get("general"):
+            return self._run_general(r, s, L)
+        from vllm.models.deepseek_v41.common.ops import fused_indexer_q_rope_quant, indexer_k_norm_rope_store
+        from vllm.models.deepseek_v41.common.ops.cache_utils import compute_global_topk_indices_and_lens
+        from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import fused_save_compress_norm, rope_quant_insert
+
+        X, W, d, v = self.X, self.W[r][L], s["idx"], self.views[r]
+        R, ratio = s["R"], RATIO[L]
+        x, qr, pos = s["a"], s["ws"]["qr"], s["pos"]
+        oi = d["oi"]
+        if L == min(l for l in LAYERS if l in self.eng.layers):   # once per step: DeepGEMM schedules from device lengths
+            if torch.cuda.is_current_stream_capturing():
+                d["dev_bt_captured"] = bool(d.get("dev_bt"))     # upload() asserts every later step matches
+            if d.get("dev_bt"):    # the step's block tables = the persistent per-slot table's rows (in the graph)
+                torch.index_select(v["dbt"], 0, d["preq_slot"], out=d["bt"])
+            mir = d.get("mir")
+            if mir is not None:   # lever (a): encoded table, refresh [wm, L) of each sequence, wm = L, mirror store slots
+                assert d.get("dev_bt"), "idx mirror: device block tables only (D12 / D13)"
+                torch.index_select(mir.mdbt, 0, d["preq_slot"], out=d["mbt"])
+                mir.ext.refresh(d["bt"], d["mbt"], d["preq_slot"], d["seq_lens"][1], mir.wm, mir.pool_span, mir.mir, 64)
+                mir.wm.index_copy_(0, d["preq_slot"], (d["seq_lens"][1][:, 0] - 1).clamp(min=0).to(torch.int32))
+                j = (pos // 64).clamp(0, P_MAX - 1)
+                e = d["mbt"].view(-1).index_select(0, d["t2r"].long() * P_MAX + j)
+                mapped = (e & mir.bit) != 0
+                ms = (e & (mir.bit - 1)).long()
+                d["mcs"][1].copy_(torch.where(mapped & (d["cslot"][1] >= 0), ms * 64 + pos % 64, -1))
+                d["mcs"][2].copy_(torch.where(mapped & (d["cslot"][2] >= 0), ms * 32 + (pos % 64) // 2, -1))
+            for Ls in KV_SOURCES:
+                if Ls in self.eng.layers and self.logits_impl == "deepgemm":
+                    oi.sched[Ls] = X.dg_schedule(d["seq_lens"][RATIO[Ls]], self.RPP[Ls])
+            if self.mode in ("fast", "hybrid") and not getattr(oi, "fuse", False):   # fused: select reads the lengths
+                oi.nb_lens.copy_(((d["seq_lens"][1].reshape(-1) + X.CAND_BLOCK - 1) // X.CAND_BLOCK).to(torch.int32))
+        side = d.get("side")
+        if side is not None:     # IDX_SIDE: fork; the compressor (+ weights_proj) next to the q GEMM
+            cur = torch.cuda.current_stream()
+            side.wait_stream(cur)
+            sctx = torch.cuda.stream(side)
+            sctx.__enter__()
+        if L in KV_SOURCES:
+            ks = self.dbg.get(("ks", L))
+            if ks is None:
+                ks = torch.mm(x, W["comp_w"].T, out_dtype=torch.float32)
+            cslot = d["cslot"][ratio]
+            if ratio == 2:
+                fused_save_compress_norm(ks, pos, v[f"ring{L}"], d["rslot"], d["qsl"], d["t2r"], W["comp_norm"], EPS, ratio,
+                                         d["lat"])
+            else:
+                fused_save_compress_norm(ks, pos, None, cslot, None, None, W["comp_norm"], EPS, ratio, d["lat"])
+            rope_quant_insert(d["lat"], pos, W["cos_sin"], v[f"comp{L}"], cslot, ratio)
+            kpre = F.linear(d["lat"], W["idx_wk"])
+            indexer_k_norm_rope_store(kpre, pos, W["cos_sin"], W["idx_k_norm"], EPS, v[f"idxs{L}"], cslot, ratio, False)
+            if d.get("mir") is not None:   # lever (a): the same records into the mirror (mapped pages only)
+                indexer_k_norm_rope_store(kpre, pos, W["cos_sin"], W["idx_k_norm"], EPS, d["mir"].kvs[L], d["mcs"][ratio],
+                                          ratio, False)
+        if side is not None:
+            torch.mm(x, W["idx_wp"].t(), out=d["wbuf"])     # == F.linear(x, idx_wp) bitwise
+            sctx.__exit__(None, None, None)
+            q = F.linear(qr, W["idx_wq_b"])
+            cur.wait_stream(side)                            # join: the indexer reads this layer's new index-K entries
+            q8, wo = fused_indexer_q_rope_quant(pos, q.view(R, 32, 128), W["cos_sin"], d["wbuf"], 128 ** -0.5, 32 ** -0.5)
+        else:
+            w = F.linear(x, W["idx_wp"])
+            q = F.linear(qr, W["idx_wq_b"])
+            q8, wo = fused_indexer_q_rope_quant(pos, q.view(R, 32, 128), W["cos_sin"], w, 128 ** -0.5, 32 ** -0.5)
+        if ("q8", L) in self.dbg:
+            q8, wo = self.dbg[("q8", L)], self.dbg[("wo", L)]
+        lin = X.LayerIn(q8.view(d["B"], 4, 32, 128), wo, d["seq_lens"][ratio], d["max_seq_len"], d["global_rows"])
+        if getattr(oi, "fuse", False):   # IDX_FUSE: the top-k writes FlashMLA's slots / lengths itself
+            oi.layer(L, lin, glob=X.GlobalOut(s["ti"][L].view(R, 512), s["tl"][L], d["t2r"], d["bt"],
+                                              self.RPP[K_SOURCE[L]], d["valid"]))
+            return
+        top = oi.layer(L, lin)
+        g, ln = compute_global_topk_indices_and_lens(top, d["t2r"], d["bt"], self.RPP[K_SOURCE[L]], d["valid"])
+        s["ti"][L].view(R, 512).copy_(g)
+        s["tl"][L].copy_(ln)
